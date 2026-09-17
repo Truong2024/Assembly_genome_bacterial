@@ -36,12 +36,34 @@ env_exists() {
     conda env list | awk '{print $1}' | grep -qx "$1"
 }
 
+env_prefix_of() {
+    conda env list | awk -v e="$1" '$1==e {print $NF}'
+}
+
+env_bin() {
+    local prefix
+    prefix=$(env_prefix_of "$1")
+    [ -n "$prefix" ] && echo "$prefix/bin/$2"
+}
+
 tool_in_env() {
-    conda run -n "$1" which "$2" &>/dev/null
+    local env_name="$1" bin_name="$2" version_flag="${3:---version}" bin_path
+    bin_path=$(env_bin "$env_name" "$bin_name")
+    [ -n "$bin_path" ] && [ -x "$bin_path" ] || return 1
+    "$bin_path" "$version_flag" &>/dev/null
 }
 
 init_dirs() {
     mkdir -p QC_report assembly_fastq assembly busco_result quast_result busco_download
+}
+
+# QUAST (pip, bản 5.2.0) vẫn dùng module 'distutils' đã bị gỡ khỏi Python 3.12+.
+# Hàm này kiểm tra python trong pipeline_env có còn 'distutils' hay không.
+pipeline_env_python_ok() {
+    local py_bin
+    py_bin=$(env_bin "pipeline_env" "python")
+    [ -n "$py_bin" ] && [ -x "$py_bin" ] || return 1
+    "$py_bin" -c "import distutils" &>/dev/null
 }
 
 # ══════════════════════════════════════════════════════════
@@ -53,23 +75,41 @@ step_install() {
         exit 1
     fi
 
-    # pipeline_env: fastqc, fastp, quast
+    # pipeline_env: fastqc, fastp (conda) + quast (pip -> lệnh quast.py)
+    # Ép python<3.12 vì QUAST (pip) cần module 'distutils' đã bị gỡ từ Python 3.12
     if env_exists "pipeline_env"; then
-        log_skip "Môi trường 'pipeline_env'"
+        if pipeline_env_python_ok; then
+            log_skip "Môi trường 'pipeline_env'"
+        else
+            log_err "Môi trường 'pipeline_env' đang dùng Python >=3.12 (thiếu 'distutils' -> QUAST lỗi). Tạo lại môi trường..."
+            conda env remove -y -n pipeline_env
+            log_run "Tạo lại môi trường 'pipeline_env' (fastqc, fastp, python<3.12, pip)"
+            conda create -y -n pipeline_env -c bioconda -c conda-forge fastqc fastp "python<3.12" pip
+        fi
     else
-        log_run "Tạo môi trường 'pipeline_env' (fastqc, fastp, quast)"
-        conda create -y -n pipeline_env -c bioconda -c conda-forge fastqc fastp quast
+        log_run "Tạo môi trường 'pipeline_env' (fastqc, fastp, python<3.12, pip)"
+        conda create -y -n pipeline_env -c bioconda -c conda-forge fastqc fastp "python<3.12" pip
     fi
-    for tool_spec in "fastqc:fastqc" "fastp:fastp" "quast:quast"; do
+
+    # fastqc, fastp: cài qua conda (bioconda)
+    for tool_spec in "fastqc:fastqc" "fastp:fastp"; do
         bin_name="${tool_spec%%:*}"
         pkg_name="${tool_spec##*:}"
         if tool_in_env "pipeline_env" "$bin_name"; then
             log_skip "Công cụ '$bin_name' trong pipeline_env"
         else
-            log_run "Cài '$pkg_name' vào pipeline_env"
+            log_run "Cài '$pkg_name' vào pipeline_env (conda)"
             conda install -y -n pipeline_env -c bioconda -c conda-forge "$pkg_name"
         fi
     done
+
+    # quast: cài qua pip (conda hay lỗi phụ thuộc), lệnh chạy là quast.py
+    if tool_in_env "pipeline_env" "quast.py"; then
+        log_skip "Công cụ 'quast.py' trong pipeline_env"
+    else
+        log_run "Cài 'quast' vào pipeline_env (pip)"
+        conda run --no-capture-output -n pipeline_env pip install --force-reinstall --no-cache-dir quast
+    fi
 
     # unicycler_env
     if env_exists "unicycler_env"; then
@@ -252,8 +292,14 @@ step_quast() {
     if exists "quast_result/report.html"; then
         log_skip "QUAST (report.html đã có trong quast_result/)"
     else
+        local quast_bin
+        quast_bin=$(env_bin "pipeline_env" "quast.py")
+        if [ -z "$quast_bin" ] || [ ! -x "$quast_bin" ]; then
+            log_err "Không tìm thấy quast.py trong pipeline_env. Hãy chạy lại bước cài đặt (-1) trước."
+            exit 1
+        fi
         log_run "QUAST thống kê chất lượng assembly (log chạy hiển thị trực tiếp bên dưới)"
-        conda run --no-capture-output -n pipeline_env quast \
+        conda run --no-capture-output -n pipeline_env "$quast_bin" \
           -o quast_result \
           -t 8 \
           assembly/assembly.fasta
